@@ -110,6 +110,10 @@
 #include "help.h"
 #include "awl/aslider.h"
 
+#ifdef USE_LAME
+#include "exportmp3.h"
+#endif
+
 #ifdef AEOLUS
 extern Ms::Synthesizer* createAeolus();
 #endif
@@ -5029,6 +5033,300 @@ SynthesizerState MuseScore::synthesizerState()
       return synti ? synti->state() : state;
       }
 
+
+
+//---------------------------------------------------------
+//   canSaveMp3
+//---------------------------------------------------------
+
+bool MuseScore::canSaveMp3()
+      {
+#ifndef USE_LAME
+      return false;
+#else
+      MP3Exporter exporter;
+      if (!exporter.loadLibrary(MP3Exporter::AskUser::NO)) {
+            qDebug("Could not open MP3 encoding library!");
+            return false;
+            }
+
+      if (!exporter.validLibraryLoaded()) {
+            qDebug("Not a valid or supported MP3 encoding library!");
+            return false;
+            }
+      return true;
+#endif
+      }
+
+//---------------------------------------------------------
+//   saveMp3
+//---------------------------------------------------------
+
+bool MuseScore::saveMp3(Score* score, const QString& name)
+      {
+#ifndef USE_LAME
+      return false;
+#else
+      EventMap events;
+      score->renderMidi(&events);
+      if(events.size() == 0)
+            return false;
+
+      MP3Exporter exporter;
+      if (!exporter.loadLibrary(MP3Exporter::AskUser::MAYBE)) {
+            QSettings settings;
+            settings.setValue("/Export/lameMP3LibPath", "");
+            if(!MScore::noGui)
+                  QMessageBox::warning(0,
+                               tr("Error Opening LAME library"),
+                               tr("Could not open MP3 encoding library!"),
+                               QString::null, QString::null);
+            qDebug("Could not open MP3 encoding library!");
+            return false;
+            }
+
+      if (!exporter.validLibraryLoaded()) {
+            QSettings settings;
+            settings.setValue("/Export/lameMP3LibPath", "");
+            if(!MScore::noGui)
+                  QMessageBox::warning(0,
+                               tr("Error Opening LAME library"),
+                               tr("Not a valid or supported MP3 encoding library!"),
+                               QString::null, QString::null);
+            qDebug("Not a valid or supported MP3 encoding library!");
+            return false;
+            }
+
+      // Retrieve preferences
+//      int highrate = 48000;
+//      int lowrate = 8000;
+//      int bitrate = 64;
+//      int brate = 128;
+//      int rmode = MODE_CBR;
+//      int vmode = ROUTINE_FAST;
+//      int cmode = CHANNEL_STEREO;
+
+      int channels = 2;
+
+      int oldSampleRate = MScore::sampleRate;
+      int sampleRate = preferences.exportAudioSampleRate;
+      exporter.setBitrate(preferences.exportMp3BitRate);
+
+      int inSamples = exporter.initializeStream(channels, sampleRate);
+      if (inSamples < 0) {
+            if (!MScore::noGui) {
+                  QMessageBox::warning(0, tr("Encoding Error"),
+                     tr("Unable to initialize MP3 stream"),
+                     QString::null, QString::null);
+                  }
+            qDebug("Unable to initialize MP3 stream");
+            MScore::sampleRate = oldSampleRate;
+            return false;
+            }
+
+      QFile file(name);
+      if (!file.open(QIODevice::WriteOnly)) {
+            if (!MScore::noGui) {
+                  QMessageBox::warning(0,
+                     tr("Encoding Error"),
+                     tr("Unable to open target file for writing"),
+                     QString::null, QString::null);
+                  }
+            MScore::sampleRate = oldSampleRate;
+            return false;
+            }
+
+      int bufferSize   = exporter.getOutBufferSize();
+      uchar* bufferOut = new uchar[bufferSize];
+      MasterSynthesizer* synti = synthesizerFactory();
+      synti->init();
+      synti->setSampleRate(sampleRate);
+      if (MScore::noGui) { // use score settings if possible
+            bool r = synti->setState(score->synthesizerState());
+            if (!r)
+                  synti->init();
+            }
+      else { // use current synth settings
+            bool r = synti->setState(mscore->synthesizerState());
+            if (!r)
+                  synti->init();
+            }
+
+      MScore::sampleRate = sampleRate;
+
+      QProgressDialog progress(this);
+      progress.setWindowFlags(Qt::WindowFlags(Qt::Dialog | Qt::FramelessWindowHint | Qt::WindowTitleHint));
+      progress.setWindowModality(Qt::ApplicationModal);
+      //progress.setCancelButton(0);
+      progress.setCancelButtonText(tr("Cancel"));
+      progress.setLabelText(tr("Exporting..."));
+      if (!MScore::noGui)
+            progress.show();
+
+      static const int FRAMES = 512;
+      float bufferL[FRAMES];
+      float bufferR[FRAMES];
+
+      float  peak = 0.0;
+      double gain = 1.0;
+      EventMap::const_iterator endPos = events.cend();
+      --endPos;
+      const int et = (score->utick2utime(endPos->first) + 1) * MScore::sampleRate;
+      const int maxEndTime = (score->utick2utime(endPos->first) + 3) * MScore::sampleRate;
+      progress.setRange(0, et);
+
+      for (int pass = 0; pass < 2; ++pass) {
+            EventMap::const_iterator playPos;
+            playPos = events.cbegin();
+            synti->allSoundsOff(-1);
+
+            //
+            // init instruments
+            //
+            foreach(Part* part, score->parts()) {
+                  const InstrumentList* il = part->instruments();
+                  for(auto i = il->begin(); i!= il->end(); i++) {
+                        foreach(const Channel* a, i->second->channel()) {
+                              a->updateInitList();
+                              foreach(MidiCoreEvent e, a->init) {
+                                    if (e.type() == ME_INVALID)
+                                          continue;
+                                    e.setChannel(a->channel);
+                                    int syntiIdx= synti->index(score->midiMapping(a->channel)->articulation->synti);
+                                    synti->play(e, syntiIdx);
+                                    }
+                              }
+                        }
+                  }
+
+            int playTime = 0.0;
+
+            for (;;) {
+                  unsigned frames = FRAMES;
+                  float max = 0;
+                  //
+                  // collect events for one segment
+                  //
+                  memset(bufferL, 0, sizeof(float) * FRAMES);
+                  memset(bufferR, 0, sizeof(float) * FRAMES);
+                  double endTime = playTime + frames;
+
+                  float* l = bufferL;
+                  float* r = bufferR;
+
+                  for (; playPos != events.cend(); ++playPos) {
+                        double f = score->utick2utime(playPos->first) * MScore::sampleRate;
+                        if (f >= endTime)
+                              break;
+                        int n = f - playTime;
+                        if (n) {
+                              float bu[n * 2];
+                              memset(bu, 0, sizeof(float) * 2 * n);
+
+                              synti->process(n, bu);
+                              float* sp = bu;
+                              for (int i = 0; i < n; ++i) {
+                                    *l++ = *sp++;
+                                    *r++ = *sp++;
+                                    }
+                              playTime  += n;
+                              frames    -= n;
+                              }
+                        const NPlayEvent& e = playPos->second;
+                        if (e.isChannelEvent()) {
+                              int channelIdx = e.channel();
+                              Channel* c = score->midiMapping(channelIdx)->articulation;
+                              if (!c->mute) {
+                                    synti->play(e, synti->index(c->synti));
+                                    }
+                              }
+                        }
+                  if (frames) {
+                        float bu[frames * 2];
+                        memset(bu, 0, sizeof(float) * 2 * frames);
+                        synti->process(frames, bu);
+                        float* sp = bu;
+                        for (unsigned i = 0; i < frames; ++i) {
+                              *l++ = *sp++;
+                              *r++ = *sp++;
+                              }
+                        playTime += frames;
+                        }
+
+                  if (pass == 1) {
+                        for (int i = 0; i < FRAMES; ++i) {
+                              max = qMax(max, qAbs(bufferL[i]));
+                              max = qMax(max, qAbs(bufferR[i]));
+                              bufferL[i] *= gain;
+                              bufferR[i] *= gain;
+                              }
+                        long bytes;
+                        if (FRAMES < inSamples)
+                              bytes = exporter.encodeRemainder(bufferL, bufferR,  FRAMES , bufferOut);
+                        else
+                              bytes = exporter.encodeBuffer(bufferL, bufferR, bufferOut);
+                        if (bytes < 0) {
+                              if (MScore::noGui)
+                                    qDebug("exportmp3: error from encoder: %ld", bytes);
+                              else
+                                    QMessageBox::warning(0,
+                                       tr("Encoding Error"),
+                                       tr("Error %1 returned from MP3 encoder").arg(bytes),
+                                       QString::null, QString::null);
+                              break;
+                              }
+                        else
+                              file.write((char*)bufferOut, bytes);
+                        }
+                  else {
+                        for (int i = 0; i < FRAMES; ++i) {
+                              max = qMax(max, qAbs(bufferL[i]));
+                              max = qMax(max, qAbs(bufferR[i]));
+                              peak = qMax(peak, qAbs(bufferL[i]));
+                              peak = qMax(peak, qAbs(bufferR[i]));
+                              }
+                        }
+                  playTime = endTime;
+                  if (!MScore::noGui) {
+                        if (progress.wasCanceled())
+                              break;
+                        progress.setValue((pass * et + playTime) / 2);
+                        qApp->processEvents();
+                        }
+                  if (playTime >= et)
+                        synti->allNotesOff(-1);
+                  // create sound until the sound decays
+                  if (playTime >= et && max * peak < 0.000001)
+                        break;
+                  // hard limit
+                  if (playTime > maxEndTime)
+                        break;
+                  }
+            if (progress.wasCanceled())
+                  break;
+            if (pass == 0 && peak == 0.0) {
+                  qDebug("song is empty");
+                  break;
+                  }
+            gain = 0.99 / peak;
+            }
+
+      long bytes = exporter.finishStream(bufferOut);
+      if (bytes > 0L)
+            file.write((char*)bufferOut, bytes);
+
+      bool wasCanceled = progress.wasCanceled();
+      progress.close();
+      delete synti;
+      delete[] bufferOut;
+      file.close();
+      if (wasCanceled)
+            file.remove();
+      MScore::sampleRate = oldSampleRate;
+      return true;
+#endif
+      }
+
 }
 
 using namespace Ms;
@@ -5079,33 +5377,33 @@ int main(int argc, char* av[])
     //parser.addOption(QCommandLineOption({"v", "version"}, "Print version")); // see above
       parser.addOption(QCommandLineOption(      "long-version", "Print detailed version information"));
       parser.addOption(QCommandLineOption({"d", "debug"}, "Debug mode"));
-      parser.addOption(QCommandLineOption({"L", "layout-debug"}, "Layout debug"));
+      parser.addOption(QCommandLineOption({"L", "layout-debug"}, "Layout debug mode"));
       parser.addOption(QCommandLineOption({"s", "no-synthesizer"}, "No internal synthesizer"));
-      parser.addOption(QCommandLineOption({"m", "no-midi"}, "No midi"));
+      parser.addOption(QCommandLineOption({"m", "no-midi"}, "No MIDI"));
       parser.addOption(QCommandLineOption({"a", "use-audio"}, "Use audio driver: jack, alsa, pulse, or portaudio", "driver"));
       parser.addOption(QCommandLineOption({"n", "new-score"}, "Start with new score"));
       parser.addOption(QCommandLineOption({"I", "dump-midi-in"}, "Dump midi input"));
       parser.addOption(QCommandLineOption({"O", "dump-midi-out"}, "Dump midi output"));
-      parser.addOption(QCommandLineOption({"o", "export-to"}, "Export to 'file'; format depends on file extension", "file"));
-      parser.addOption(QCommandLineOption({"r", "image-resolution"}, "Set output resolution for image export", "dpi"));
-      parser.addOption(QCommandLineOption({"T", "trim-image"}, "Trim exported image with specified margin (in pixels)", "margin"));
+      parser.addOption(QCommandLineOption({"o", "export-to"}, "Export to 'file'. Format depends on file's extension", "file"));
+      parser.addOption(QCommandLineOption({"r", "image-resolution"}, "Used with '-o <file>.png'. Set output resolution for image export", "DPI"));
+      parser.addOption(QCommandLineOption({"T", "trim-image"}, "Used with '-o <file>.png' and '-o <file.svg>'. Trim exported image with specified margin (in pixels)", "margin"));
       parser.addOption(QCommandLineOption({"x", "gui-scaling"}, "Set scaling factor for GUI elements", "factor"));
-      parser.addOption(QCommandLineOption({"D", "monitor-resolution"}, "Specify monitor resolution", "dpi"));
+      parser.addOption(QCommandLineOption({"D", "monitor-resolution"}, "Specify monitor resolution", "DPI"));
       parser.addOption(QCommandLineOption({"S", "style"}, "Load style file", "style"));
       parser.addOption(QCommandLineOption({"p", "plugin"}, "Execute named plugin", "name"));
       parser.addOption(QCommandLineOption(      "template-mode", "Save template mode, no page size"));
       parser.addOption(QCommandLineOption({"F", "factory-settings"}, "Use factory settings"));
       parser.addOption(QCommandLineOption({"R", "revert-settings"}, "Revert to default preferences"));
       parser.addOption(QCommandLineOption({"i", "load-icons"}, "Load icons from INSTALLPATH/icons"));
-      parser.addOption(QCommandLineOption({"j", "job"}, "process a conversion job", "file"));
+      parser.addOption(QCommandLineOption({"j", "job"}, "Process a conversion job", "file"));
       parser.addOption(QCommandLineOption({"e", "experimental"}, "Enable experimental features"));
-      parser.addOption(QCommandLineOption({"c", "config-folder"}, "Override config/settings folder", "dir"));
-      parser.addOption(QCommandLineOption({"t", "test-mode"}, "Set testMode flag for all files"));
+      parser.addOption(QCommandLineOption({"c", "config-folder"}, "Override configuration and settings folder", "dir"));
+      parser.addOption(QCommandLineOption({"t", "test-mode"}, "Set test mode flag for all files"));
       parser.addOption(QCommandLineOption({"M", "midi-operations"}, "Specify MIDI import operations file", "file"));
       parser.addOption(QCommandLineOption({"w", "no-webview"}, "No web view in start center"));
-      parser.addOption(QCommandLineOption({"P", "export-score-parts"}, "Used with -o <file>.pdf, export score + parts"));
-      parser.addOption(QCommandLineOption({"f", "force"}, "Used with -o, ignore warnings reg. score being corrupted or from wrong version"));
-      parser.addOption(QCommandLineOption({"b", "bitrate"}, "Used with -o <file>.mp3, sets bitrate", "bitrate"));
+      parser.addOption(QCommandLineOption({"P", "export-score-parts"}, "Used with '-o <file>.pdf', export score and parts"));
+      parser.addOption(QCommandLineOption({"f", "force"}, "Used with '-o <file>', ignore warnings reg. score being corrupted or from wrong version"));
+      parser.addOption(QCommandLineOption({"b", "bitrate"}, "Used with '-o <file>.mp3', sets bitrate", "bitrate"));
 
       parser.addPositionalArgument("scorefiles", "The files to open", "[scorefile...]");
 
